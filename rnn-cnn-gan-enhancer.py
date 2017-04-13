@@ -66,26 +66,30 @@ def discriminator_model():
 
     input_song = Input(shape=(generating_size,156))
     
-
     joint = Reshape((generating_size,156,1))(input_song)
-    joint = TimeDistributed(Convolution1D(filters=20,kernel_size=6, padding='valid', strides=2))(joint) #tercie * ligatura(proto 2 strides)
+    joint = TimeDistributed(Convolution1D(filters=20,kernel_size=8, padding='valid', strides=2))(joint) #tercie (3 pultony = sleduji 4 noty) * ligatura(proto 2 strides)
     #39
     joint = Activation('relu')(joint)
-    joint = TimeDistributed(Convolution1D(filters=50,kernel_size=3, padding='valid', strides=1))(joint) #kvinty
+    joint = TimeDistributed(Convolution1D(filters=40,kernel_size=3, padding='valid', strides=1))(joint) # velka tercie 4 pultony a cista kvarta 5 pultonu
     #38
     joint = Activation('relu')(joint)
-    joint = TimeDistributed(Convolution1D(filters=200,kernel_size=9, padding='valid', strides=2))(joint) #cela oktava (12 not)
+    joint = TimeDistributed(Convolution1D(filters=200,kernel_size=3, padding='valid', strides=1))(joint) # kvinty 7 pultonu = sleduji 8 not
     #17
     joint = Activation('relu')(joint)
-    joint = TimeDistributed(Convolution1D(filters=300,kernel_size=3, padding='valid', strides=2))(joint)
+    joint = TimeDistributed(MaxPooling1D(3))(joint) # chci dominantni akord
+
+    joint = TimeDistributed(Convolution1D(filters=300,kernel_size=3, padding='valid', strides=1))(joint)
     #5
+    print joint.shape
     joint = Activation('relu')(joint)
     joint = TimeDistributed(MaxPooling1D(2))(joint)
+    print joint.shape
     joint = TimeDistributed(Convolution1D(filters=400,kernel_size=3, padding='valid', strides=2))(joint)
     #5
+    print joint.shape
     joint = Activation('relu')(joint)
     # (gen_size, 66, 20)
-    cross_joint = Reshape((generating_size,3*400))(joint)
+    cross_joint = Reshape((generating_size,4*400))(joint)
     joint = TimeDistributed(Dense(1))(cross_joint)
     joint = Activation('relu')(joint)
     joint = Flatten()(joint)
@@ -113,7 +117,7 @@ def discriminator_model():
     ## check structure
 
     structure = Reshape((generating_size,156,1))(input_song)
-    structure = TimeDistributed(Convolution1D(filters=16,kernel_size=6, padding='same', strides=4))(structure) #tercie*ligatura
+    structure = TimeDistributed(Convolution1D(filters=16,kernel_size=8, padding='same', strides=4))(structure) #tercie*ligatura
     # 78
     structure = Activation('relu')(structure)
     structure = TimeDistributed(Convolution1D(filters=25,kernel_size=2, padding='valid', strides=2))(structure) #kvinty
@@ -316,9 +320,6 @@ def train(BATCH_SIZE, SONG_LENGTH, EPOCH):
 
     print "loaded weights"
 
-
-    ## UNCOMMENT ON NEW TRAIN
-    
     latent_batches = createBatches(latent_music, SONG_LENGTH, BATCH_SIZE)
     
     '''
@@ -345,12 +346,12 @@ def train(BATCH_SIZE, SONG_LENGTH, EPOCH):
     print "loaded disc weights"
     steps = len(latent_batches)*80*BATCH_SIZE
     steps = steps/4
-    #discriminator.fit_generator(generate_from_midis("discriminator_memory", "music"), steps_per_epoch=100, epochs=3)
+    discriminator.fit_generator(generate_from_midis("discriminator_memory", "music"), steps_per_epoch=100, epochs=3)
     #discriminator.fit_generator(generate_from_midis("discriminator_memory", "music"), steps_per_epoch=500, epochs=1)
-    #discriminator.save_weights('discriminator first train')
-    discriminator.load_weights('discriminator first train')
-    discriminator.fit_generator(generate_from_midis("discriminator_memory", "music"), steps_per_epoch=50, epochs=1)
-    for epoch in range(54, 100):
+    discriminator.save_weights('discriminator first train')
+    #discriminator.load_weights('discriminator first train')
+    #discriminator.fit_generator(generate_from_midis("discriminator_memory", "music"), steps_per_epoch=50, epochs=1)
+    for epoch in range(1, 100):
         
         if epoch % 4 == 0:
             generator.load_weights('generator_identity')
@@ -368,8 +369,6 @@ def train(BATCH_SIZE, SONG_LENGTH, EPOCH):
             
             for i in xrange(1):
 
-                #ZKUS TADY TEN FIT bude to lip fungovat s optimizerama
-                ## keep surprise
                 what_to_train = [random.uniform(1.0, 1.0) for i in range(BATCH_SIZE)]
                 g_loss = generator_with_discriminator.train_on_batch(
                     latent_batches[indexer % len(latent_batches)], np.array([what_to_train]).reshape((BATCH_SIZE,1)))
@@ -402,7 +401,7 @@ def train(BATCH_SIZE, SONG_LENGTH, EPOCH):
 
         discriminator.trainable = True
         
-        for i in range(10):
+        for i in range(7):
             index = i % len(latent_batches)
             hard_train = discriminator.train_on_batch(generator.predict_on_batch(latent_batches[index]), np.array([np.random.uniform(0.0,0.0)]*BATCH_SIZE).reshape((BATCH_SIZE,1)))
             print "hard train loss ", hard_train, " example ", i
