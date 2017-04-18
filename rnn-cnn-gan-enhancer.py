@@ -6,7 +6,9 @@ from keras.layers.convolutional import Convolution1D, Convolution2D, ZeroPadding
 from keras.layers.pooling import GlobalMaxPooling1D, AveragePooling1D, MaxPooling1D
 from keras.layers.wrappers import TimeDistributed, Bidirectional
 from keras.layers.recurrent import GRU, LSTM, SimpleRNN
+from keras.regularizers import l2, l1, l1_l2
 from keras import backend
+from keras.layers.advanced_activations import ELU, PReLU, LeakyReLU
 from keras.layers import Layer
 import keras.layers
 import keras
@@ -16,6 +18,7 @@ import random
 import theano.tensor as T
 import random
 import os
+import tensorflow as tf
 
 from keras.optimizers import SGD
 import numpy as np
@@ -27,145 +30,172 @@ import train as trainLoadMusic
 np.random.seed(26041994)
 
 generating_size = 50*8 # not recommended to change here or via --song_length as a change is also needed in the model
-                       # generating latent music 
+                       # that generates latent music
 note_span_with_ligatures = 156 # will be used as a "magic number constant" in convolution filters
 
 def generator_model():
 
-
     input_song = Input(shape=(generating_size,156))
-    amplified = keras.layers.core.Lambda(lambda x:x * 18 - 9)(input_song)
+    amplified = keras.layers.core.Lambda(lambda x:x * 12 - 6)(input_song)
 
-    forget = LSTM(156, activation='sigmoid', kernel_initializer='zeros', return_sequences=True)(input_song)
+    forget = LSTM(250, return_sequences=True)(input_song)
+    forget = keras.layers.local.LocallyConnected1D(156,1,activation='sigmoid', kernel_initializer='zeros', bias_initializer=keras.initializers.Constant(-6.0))(forget)
 
-    forget = keras.layers.core.Lambda(lambda x:-(18*x))(forget)
+    conservativity_sum_0 = Lambda(lambda x: backend.sum(x, axis=1), output_shape=lambda s: (s[0], s[2]))(forget)
+    conservativity_sum_0 = Lambda(lambda x: backend.sum(x[:,::2], axis=1), output_shape=lambda s: (s[0],1))(conservativity_sum_0)
+    tresh = keras.layers.advanced_activations.ThresholdedReLU(theta=400.0)(conservativity_sum_0)
 
-    add = LSTM(156, activation='sigmoid', kernel_initializer='zeros',return_sequences=True)(input_song)
-    conservativity_sum = Lambda(lambda x: backend.sum(x, axis=1), output_shape=lambda s: (s[0], s[2]))(add)
-    print conservativity_sum.shape
-    conservativity_sum = Lambda(lambda x: backend.sum(x, axis=1), output_shape=lambda s: (s[0],1))(conservativity_sum)
-    print conservativity_sum.shape
-    ## tady ovlivnuju decko aby nevyzralo na rodice (diky tomu to vlastne funguje)
-    tresholdfound = keras.layers.advanced_activations.ThresholdedReLU(theta=70.0)(conservativity_sum)
-    add = Lambda(lambda x:x - tresholdfound)(add)
-    add = Activation('relu')(add)
-    
-    add = keras.layers.core.Lambda(lambda x:(20*x))(add)
+    # this will be zero if treshold was not found,
+    tresh = Lambda(lambda x:backend.log(x+1))(tresh)
+
+    # penalty the forget gate for forgetting too much, loged to avoid vanishing gradient for next activation
+    forget = Lambda(lambda x:x-tresh)(forget)
+
+    forget = keras.layers.core.Lambda(lambda x:(5.5*x))(forget)
+    forget = Activation('sigmoid')(forget)
+
+    # multiply to be able to outvote residual 6* connection    
+    forget = keras.layers.core.Lambda(lambda x:-(12*x))(forget)
+
+
+    add = LSTM(250,kernel_initializer='zeros', return_sequences=True)(input_song)
+    add = keras.layers.local.LocallyConnected1D(156,1,activation='sigmoid', kernel_initializer='zeros', bias_initializer=keras.initializers.Constant(-6.0))(add)
+    conservativity_sum_1 = Lambda(lambda x: backend.sum(x, axis=1), output_shape=lambda s: (s[0], s[2]))(add)
+    conservativity_sum_1 = Lambda(lambda x: backend.sum(x[:,::2], axis=1), output_shape=lambda s: (s[0],1))(conservativity_sum_1)
+
+    treshold = keras.layers.advanced_activations.ThresholdedReLU(theta=60.0)(conservativity_sum_1)
+
+    # this will be zero if treshold was not found, logarithmed to avoid vanishing problem with the succeding add gate
+    treshold = Lambda(lambda x:backend.log(x+1))(treshold)
+
+    # penalty the forget gate for forgetting too much
+    add = Lambda(lambda x:x-treshold)(add)
+    add = keras.layers.core.Lambda(lambda x:(5.5*x))(add)
+    add = Activation('sigmoid')(add)
+
+    # multiply to be able to outvote residual 6* connection    
+    add = keras.layers.core.Lambda(lambda x:(x*12))(add)
     
     #lstm = TimeDistributed(Dense(156, kernel_initializer='zeros'))(lstm)
     
     residual = keras.layers.merge([amplified, forget, add], mode='sum')
     residual = Activation('sigmoid')(residual)
 
-    model = Model(inputs=input_song, outputs=residual)
+    # mask the ligatures/articulations to not be learned, where the corresponding note is not played
+    mask_for_articulation = keras.layers.advanced_activations.ThresholdedReLU(theta=0.5)(residual)
+    mask_for_articulation = Lambda(lambda x:x[:,:,1::2], output_shape=lambda s: (s[0], s[1], 78))(mask_for_articulation)
+    play =  Lambda(lambda x:x[:,:,::2], output_shape=lambda s: (s[0], s[1], 78))(residual)
+    reshaped_play = Reshape((generating_size,78,1))(play)
+    arti =  Lambda(lambda x:x[:,:,1::2], output_shape=lambda s: (s[0], s[1], 78))(residual)
+    articulate = Lambda(lambda x: x * mask_for_articulation)(arti)
+    reshaped_articulate = Reshape((generating_size,78,1))(articulate)
+    final = keras.layers.concatenate([reshaped_play, reshaped_articulate])
+    final = Reshape((generating_size,156))(final)
+
+    model = Model(inputs=input_song, outputs=final)
     return model
 
 def discriminator_model():
 
-    ## check joint
-
+     ## check joint
+    
     input_song = Input(shape=(generating_size,156))
     
     joint = Reshape((generating_size,156,1))(input_song)
     joint = TimeDistributed(Convolution1D(filters=20,kernel_size=8, padding='valid', strides=2))(joint) #tercie (3 pultony = sleduji 4 noty) * ligatura(proto 2 strides)
     #39
-    joint = Activation('relu')(joint)
+    joint = Activation(LeakyReLU(0.3))(joint)
     joint = TimeDistributed(Convolution1D(filters=40,kernel_size=3, padding='valid', strides=1))(joint) # velka tercie 4 pultony a cista kvarta 5 pultonu
     #38
-    joint = Activation('relu')(joint)
+    joint = Activation(LeakyReLU(0.3))(joint)
     joint = TimeDistributed(Convolution1D(filters=200,kernel_size=3, padding='valid', strides=1))(joint) # kvinty 7 pultonu = sleduji 8 not
     #17
-    joint = Activation('relu')(joint)
-    joint = TimeDistributed(MaxPooling1D(3))(joint) # chci dominantni akord
+    joint = Activation(LeakyReLU(0.3))(joint)
+    joint = TimeDistributed(MaxPooling1D(2))(joint) # chci dominantni akord
 
     joint = TimeDistributed(Convolution1D(filters=300,kernel_size=3, padding='valid', strides=1))(joint)
     #5
     print joint.shape
-    joint = Activation('relu')(joint)
+    joint = Activation(LeakyReLU(0.3))(joint)
     joint = TimeDistributed(MaxPooling1D(2))(joint)
     print joint.shape
     joint = TimeDistributed(Convolution1D(filters=400,kernel_size=3, padding='valid', strides=2))(joint)
     #5
     print joint.shape
-    joint = Activation('relu')(joint)
+    joint = Activation(LeakyReLU(0.3))(joint)
     # (gen_size, 66, 20)
-    cross_joint = Reshape((generating_size,4*400))(joint)
-    joint = TimeDistributed(Dense(1))(cross_joint)
-    joint = Activation('relu')(joint)
+    cross_joint = Reshape((generating_size,7*400))(joint)
+    joint = TimeDistributed(Dense(50))(cross_joint)
     joint = Flatten()(joint)
-    #sem zkus dropout
     joint = Dropout(0.5)(joint)
-    joint = Dense(3)(joint)
-    joint = Activation('tanh')(joint)
+    joint = Dense(1, kernel_regularizer=keras.regularizers.l2(0.1))(joint)
+    joint = Activation(LeakyReLU(0.3))(joint)
 
     ## check rhythm
     
     rhythm = ZeroPadding1D(4)(input_song) # 4 on both sides, so locally connecteds kernel will be 9 (bc. they don't supp 'same' yet)
-    rhythm = Convolution1D(filters=24*10, kernel_size=24, strides=16, padding='valid')(rhythm)
-    rhythm = Activation('relu')(rhythm)
-    rhythm = Reshape((generating_size/16, 24, 10))(rhythm)
-    rhythm = TimeDistributed(keras.layers.local.LocallyConnected1D(filters=40, kernel_size=9, padding='valid'))(rhythm)
-    rhythm = Activation('relu')(rhythm)
-    rhythm = TimeDistributed(Dense(1))(rhythm)
-    rhythm = Activation('relu')(rhythm)
+    rhythm = Convolution1D(filters=20*20, kernel_size=24, strides=16, padding='valid')(rhythm)
+    rhythm = Activation(LeakyReLU(0.3))(rhythm)
+    rhythm = Reshape((generating_size/16, 20, 20))(rhythm)
+    rhythm = TimeDistributed(keras.layers.local.LocallyConnected1D(filters=100, kernel_size=9, padding='valid'))(rhythm)
+    rhythm = Activation(LeakyReLU(0.3))(rhythm)
+    rhythm = TimeDistributed(Dense(50))(rhythm)
     rhythm = Flatten()(rhythm)
-    #sem zkus dropout
     rhythm = Dropout(0.5)(rhythm)
-    rhythm = Dense(2)(rhythm)
-    rhythm = Activation('tanh')(rhythm)
+    rhythm = Dense(1, kernel_regularizer=keras.regularizers.l2(0.1))(rhythm)
+    rhythm = Activation(LeakyReLU(0.3))(rhythm)
 
     ## check structure
 
     structure = Reshape((generating_size,156,1))(input_song)
     structure = TimeDistributed(Convolution1D(filters=16,kernel_size=8, padding='same', strides=4))(structure) #tercie*ligatura
     # 78
-    structure = Activation('relu')(structure)
-    structure = TimeDistributed(Convolution1D(filters=25,kernel_size=2, padding='valid', strides=2))(structure) #kvinty
+    structure = Activation(LeakyReLU(0.3))(structure)
+    structure = TimeDistributed(Convolution1D(filters=32,kernel_size=2, padding='valid', strides=2))(structure) #kvinty
     structure = TimeDistributed(MaxPooling1D(2))(structure)
-    structure = Reshape((generating_size,9*25))(structure)
-    structure = TimeDistributed(Dense(40))(structure)
-    structure = Convolution1D(60,2)(structure)
-    structure = Activation('relu')(structure)
-    structure = Convolution1D(80,2, dilation_rate=2)(structure)
-    structure = Activation('relu')(structure)
-    structure = Convolution1D(100,2, dilation_rate=4)(structure)
-    structure = Activation('relu')(structure)
-    structure = Convolution1D(120,2, dilation_rate=8)(structure)
-    structure = Activation('relu')(structure)
-    structure = TimeDistributed(Dense(1))(structure)
-    structure = Activation('relu')(structure)
-    #sem zkus dropout
+    structure = Reshape((generating_size,9*32))(structure)
+    structure = Convolution1D(80,2)(structure)
+    structure = Activation(LeakyReLU(0.3))(structure)
+    structure = Convolution1D(120,2, dilation_rate=2)(structure)
+    structure = Activation(LeakyReLU(0.3))(structure)
+    structure = Convolution1D(160,2, dilation_rate=4)(structure)
+    structure = Activation(LeakyReLU(0.3))(structure)
+    structure = Convolution1D(200,2, dilation_rate=8)(structure)
+    structure = Activation(LeakyReLU(0.3))(structure)
+    structure = TimeDistributed(Dense(50))(structure)
     structure = Dropout(0.5)(structure)
     structure = Flatten()(structure)
-    structure = Dense(3)(structure)
-    structure = Activation('tanh')(structure)
+    structure = Dense(1, kernel_regularizer=keras.regularizers.l2(0.1))(structure)
+    structure = Activation(LeakyReLU(0.3))(structure)
 
     ## check consistency
 
     differences = Reshape((generating_size,156,1))(input_song)
     differences = TimeDistributed(Convolution1D(filters=1,kernel_size=2, padding='same', strides=2))(differences) #tercie*ligatura
     # 78
-    differences = Activation('relu')(differences)
+    differences = Activation(LeakyReLU(0.3))(differences)
     differences = Reshape((generating_size,78))(differences)
     differences = Convolution1D(150,2)(differences)
     differences = SimpleRNN(200,return_sequences=True)(differences)
-    differences = TimeDistributed(Dense(1))(differences)
-    differences = Activation('relu')(differences)
+    differences = TimeDistributed(Dense(1,kernel_regularizer=keras.regularizers.l2(0.1)))(differences)
+    differences = Activation(LeakyReLU(0.3))(differences)
     differences = Flatten()(differences)
     differences = Dropout(0.5)(differences)
-    differences = Dense(1)(differences)
+    differences = Dense(1, kernel_regularizer=keras.regularizers.l2(0.1))(differences)
+    differences = Activation(LeakyReLU(0.3))(differences)
 
     continuity = GRU(150,return_sequences=True)(cross_joint)
-    continuity = Activation('relu')(continuity)
-    continuity = TimeDistributed(Dense(1))(continuity)
+    continuity = Activation(LeakyReLU(0.3))(continuity)
+    continuity = TimeDistributed(Dense(1,kernel_regularizer=keras.regularizers.l2(0.1)))(continuity)
     continuity = Flatten()(continuity)
     continuity = Dropout(0.5)(continuity)
-    continuity = Dense(1)(continuity)
+    continuity = Dense(1, kernel_regularizer=keras.regularizers.l2(0.1))(continuity)
+    continuity =  Activation(LeakyReLU(0.3))(continuity)
 
-    final = keras.layers.concatenate([joint, rhythm, structure, continuity, continuity, continuity, differences, differences, differences])
+    final = keras.layers.concatenate([joint, rhythm, structure, continuity, differences])
     final = Dropout(0.35)(final)
     final = Dense(1)(final)
-    final = Activation('sigmoid')(final)
+    #final = Activation('sigmoid')(final) # Do not use in Wasserstein GAN (also use mean_squared_error)
 
     model = Model(inputs=input_song, outputs=final)
     return model
@@ -179,9 +209,9 @@ def generator_with_discriminator_model(generator, discriminator):
     #model.add(Reshape((generating_size*156,1)))
     model.add(discriminator)
     
-    
     return model
-
+    
+    
 def createBatches(music_list, SONG_LENGTH, BATCH_SIZE):
 
     if len(music_list) == 0:
@@ -212,7 +242,7 @@ def createBatches(music_list, SONG_LENGTH, BATCH_SIZE):
 ## tahle metoda je odporna. potom prepsat at tam neni 2x skoro uplne to stejny
 def generate_from_midis(path_memory, path_train):
 
-    batch_size = 5
+    batch_size = 3
     if len(os.listdir(path_memory)) < len(os.listdir(path_train)):
         memory_music_names = os.listdir(path_memory)
         memory_music_names = [ midi for midi in memory_music_names if midi[-4:] in ('.mid', '.MID')]
@@ -227,8 +257,6 @@ def generate_from_midis(path_memory, path_train):
                 random_pos += 1
                 if len(x_memory) < generating_size or len(x_train) < generating_size:
                     continue
-                
-
                 x_memory = np.array(x_memory).reshape((1,generating_size, note_span_with_ligatures))
                 x_train = np.array(x_train).reshape((1,generating_size, note_span_with_ligatures))
 
@@ -236,18 +264,14 @@ def generate_from_midis(path_memory, path_train):
                 
                 if batch_pos % batch_size == 0:
                     batch_x = x
-                    batch_y = np.array([0,1]).reshape((2,1))
+                    batch_y = np.array([-0.5,0.5]).reshape((2,1))
                 else:
                     batch_x = np.concatenate([batch_x, x])
-                    batch_y = np.concatenate([batch_y, np.array([0,1]).reshape((2,1))])
+                    batch_y = np.concatenate([batch_y, np.array([-0.5,0.5]).reshape((2,1))])
                 
                 batch_pos += 1
                 if batch_pos % batch_size == 0:
                     yield (batch_x, batch_y)
-                
-
-                
-
     else:
         train_music_names = os.listdir(path_train)
         train_music_names = [ midi for midi in train_music_names if midi[-4:] in ('.mid', '.MID')]
@@ -270,10 +294,10 @@ def generate_from_midis(path_memory, path_train):
                 
                 if batch_pos % batch_size == 0:
                     batch_x = x
-                    batch_y = np.array([0,1]).reshape((2,1))
+                    batch_y = np.array([-0.5,0.5]).reshape((2,1))
                 else:
                     batch_x = np.concatenate([batch_x, x])
-                    batch_y = np.concatenate([batch_y, np.array([0,1]).reshape((2,1))])
+                    batch_y = np.concatenate([batch_y, np.array([-0.5,0.5]).reshape((2,1))])
                 
                 batch_pos += 1
                 if batch_pos % batch_size == 0:
@@ -285,9 +309,6 @@ def train(BATCH_SIZE, SONG_LENGTH, EPOCH):
     sys.setrecursionlimit(100000)
 
     discriminator = discriminator_model()
-    #print "loading train_music"
-    #train_music = trainLoadMusic.loadMusic("music", SONG_LENGTH)
-    #train_music = train_music.values()
     print "loading latent music"
     latent_music = trainLoadMusic.loadMusic("lstm_outputs", SONG_LENGTH)
     latent_music = latent_music.values()
@@ -298,21 +319,19 @@ def train(BATCH_SIZE, SONG_LENGTH, EPOCH):
     generator = generator_model()
     generator_with_discriminator = generator_with_discriminator_model(generator, discriminator)
 
-    #d_optim = SGD(lr=0.0005, momentum=0.9, nesterov=True)
     #d_optim = keras.optimizers.RMSprop(lr=0.0001, rho=0.9, epsilon=1e-08, decay=0.0)
     d_optim = keras.optimizers.Adam(lr=0.0001, beta_1=0.9, beta_2=0.999, epsilon=1e-08, decay=0.0)
-    #g_optim = SGD(lr=0.0005, momentum=0.9, nesterov=True)
-    g_optim = keras.optimizers.RMSprop(lr=0.0001, rho=0.9, epsilon=1e-08, decay=0.0)
-    #g_optim = keras.optimizers.Adam(lr=0.01, beta_1=0.9, beta_2=0.999, epsilon=1e-08, decay=0.0)
+    g_optim = keras.optimizers.RMSprop(lr=0.0001, rho=0.9, epsilon=1e-08, decay=0.0, clipnorm=0.5, clipvalue=0.5)
+    #g_optim = keras.optimizers.Adam(lr=0.0001, beta_1=0.9, beta_2=0.999, epsilon=1e-08, decay=0.0)
     #g_optim = keras.optimizers.Adadelta(lr=1.0,rho=0.95,epsilon=1e-8,decay=0.0)
 
     generator.compile(loss='binary_crossentropy', optimizer="adam")
     generator_with_discriminator.compile(
-        loss='binary_crossentropy', optimizer=g_optim)
+        loss='mean_squared_error', optimizer=g_optim)
 
 
     discriminator.trainable = True
-    discriminator.compile(loss='binary_crossentropy', optimizer=d_optim)
+    discriminator.compile(loss='mean_squared_error', optimizer=d_optim)
 
     
     print "loading weighsts"
@@ -320,16 +339,7 @@ def train(BATCH_SIZE, SONG_LENGTH, EPOCH):
 
     print "loaded weights"
 
-    latent_batches = createBatches(latent_music, SONG_LENGTH, BATCH_SIZE)
-    
-    '''
-    for i in range(len(latent_batches)/5):
-        index = i % len(latent_batches)
-        loss = generator.train_on_batch(latent_batches[index], latent_batches[index])
-        print "pretrain loss ", loss, " epoch ", i/len(latent_batches)
-        '''
-    
-    generator.save_weights('generator_identity')
+    latent_batches = createBatches(latent_music, SONG_LENGTH, BATCH_SIZE)  
     
     # save memory for discriminator to not forget about this being FAKE
     for j in range(len(latent_batches)):
@@ -339,26 +349,22 @@ def train(BATCH_SIZE, SONG_LENGTH, EPOCH):
             song = generate_from_probabilities(song)
             matrixToMidi(song,'discriminator_memory/after pre epochs {} example {}'.format(j,k))
     
-    #generator.load_weights("generator 3")
     print "loading disc weights"
-    #discriminator.load_weights('discriminator 99')
-    
+    #discriminator.load_weights('discriminator 2')
     print "loaded disc weights"
-    steps = len(latent_batches)*80*BATCH_SIZE
-    steps = steps/4
-    discriminator.fit_generator(generate_from_midis("discriminator_memory", "music"), steps_per_epoch=100, epochs=3)
-    #discriminator.fit_generator(generate_from_midis("discriminator_memory", "music"), steps_per_epoch=500, epochs=1)
-    discriminator.save_weights('discriminator first train')
-    #discriminator.load_weights('discriminator first train')
-    #discriminator.fit_generator(generate_from_midis("discriminator_memory", "music"), steps_per_epoch=50, epochs=1)
+    discriminator.load_weights('discriminator 2')
+    
+    discriminator.fit_generator(generate_from_midis("discriminator_memory", "music"), steps_per_epoch=40, epochs=7)
+    print discriminator.layers[-1].get_weights()
+    
     for epoch in range(1, 100):
         
-        if epoch % 4 == 0:
-            generator.load_weights('generator_identity')
+        #if epoch % 8 == 0:
+        #    generator.load_weights('generator_identity')
 
-        latent_batches = createBatches(latent_music, SONG_LENGTH, BATCH_SIZE)
+        #latent_batches = createBatches(latent_music, SONG_LENGTH, BATCH_SIZE)
         
-        for indexer in xrange(4*len(latent_batches)):
+        for indexer in xrange(3*len(latent_batches)):
             # latent_batches (batch_size, song_length, notes)
             # generated_music = generator.predict_on_batch(latent_batches[indexer % len(latent_batches)])
             
@@ -367,26 +373,40 @@ def train(BATCH_SIZE, SONG_LENGTH, EPOCH):
 
             
             
-            for i in xrange(1):
+            for i in range(100):
 
-                what_to_train = [random.uniform(1.0, 1.0) for i in range(BATCH_SIZE)]
+                what_to_train = [0.5 for j in range(BATCH_SIZE)]
                 g_loss = generator_with_discriminator.train_on_batch(
                     latent_batches[indexer % len(latent_batches)], np.array([what_to_train]).reshape((BATCH_SIZE,1)))
+                evalu = generator_with_discriminator.predict_on_batch(latent_batches[indexer % len(latent_batches)])
+                print evalu
                 print("epoch %d, batch %d gen_loss : %f" % (epoch, indexer % len(latent_batches), g_loss))
+                generated_music = generator.predict_on_batch(latent_batches[indexer % len(latent_batches)])
+                song_0 = generated_music[0].reshape((SONG_LENGTH,note_span_with_ligatures/2,2))
+                song_0 = generate_from_probabilities(song_0)
+                matrixToMidi(song_0,'outputs/test {} {}'.format(i, indexer))
+
             
             if indexer % 10 == 0:
                 song_0 = generated_music[0].reshape((SONG_LENGTH,note_span_with_ligatures/2,2))
-                song_0 = generate_from_probabilities(song_0, conservativity=0.8)
+                song_0 = generate_from_probabilities(song_0, conservativity=1.0)
                 matrixToMidi(song_0,'outputs/after {} epochs {} example 0'.format(epoch, indexer))
 
                 if indexer % len(latent_batches) == 0:
                     generator.save_weights('generator {} indexer {} '.format(epoch, indexer), True)
         
-        # generator trosku nejel
-        #generator.fit(np.array(latent_batches).reshape((len(latent_batches),generating_size,156)), np.array([1]*len(latent_batches)), batch_size=2, epochs=4,verbose=1)
         generator.save_weights('generator {}'.format(epoch), True)
 
         
+        folder = 'discriminator_memory'
+        for the_file in os.listdir(folder):
+            file_path = os.path.join(folder, the_file)
+            try:
+                if os.path.isfile(file_path):
+                    os.unlink(file_path)
+                #elif os.path.isdir(file_path): shutil.rmtree(file_path)
+            except Exception as e:
+                print(e)
 
         print "saving generated songS for discriminator"
         # save memory for discriminator to not forget about this being FAKE
@@ -401,21 +421,7 @@ def train(BATCH_SIZE, SONG_LENGTH, EPOCH):
 
         discriminator.trainable = True
         
-        for i in range(7):
-            index = i % len(latent_batches)
-            hard_train = discriminator.train_on_batch(generator.predict_on_batch(latent_batches[index]), np.array([np.random.uniform(0.0,0.0)]*BATCH_SIZE).reshape((BATCH_SIZE,1)))
-            print "hard train loss ", hard_train, " example ", i
-
-        steps_disc_epoch = (epoch +1) * len(latent_batches)
-        discriminator.fit_generator(generate_from_midis("discriminator_memory", "music"), steps_per_epoch=20, epochs=1)
-
-        for i in range(5):
-            index = i % len(latent_batches)
-            hard_train = discriminator.train_on_batch(generator.predict_on_batch(latent_batches[index]), np.array([np.random.uniform(0.0,0.0)]*BATCH_SIZE).reshape((BATCH_SIZE,1)))
-            print "hard train loss ", hard_train, " example ", i
-
-        discriminator.fit_generator(generate_from_midis("discriminator_memory", "music"), steps_per_epoch=10, epochs=1)
-
+        discriminator.fit_generator(generate_from_midis("discriminator_memory", "music"), steps_per_epoch=5, epochs=2)
         
         discriminator.save_weights('discriminator {}'.format(epoch))
 
@@ -431,26 +437,21 @@ def generate(SONG_LENGTH, nb):
 
     for i in range(nb):
 
-        noise = random.choice(latent_music)
+        latent = random.choice(latent_music)
 
-        # pozor predict bere v tom jakoby noise i batche tak bacha at si nespelete batch axis s time axis, jelikoz tady vlastne ani po batchich negenerujeme
-        song = generator.predict(noise, verbose=1)
+        song = generator.predict(latent, verbose=1)
 
-        song = song#.reshape(SONG_LENGTH,note_span_with_ligatures/2,2)
-        matrixToMidi(song,'outputs/example_GAN_{}'.format(i))
+        song = song.reshape((SONG_LENGTH,note_span_with_ligatures/2,2))
+        song_0 = generate_from_probabilities(song_0)
+        matrixToMidi(song_0,'outputs/example {}'.format(i))
 
-rng = 0
 def generate_from_probabilities(song, conservativity=1):
-
 
     for i in range(len(song)):
         for j in range(len(song[i])):
-            
             song[i][j][0] = np.random.sample(1) < song[i][j][0] * conservativity
             song[i][j][1] = np.random.sample(1) < song[i][j][1] * conservativity
-
     return song
-
 
 def get_args():
     parser = argparse.ArgumentParser()
