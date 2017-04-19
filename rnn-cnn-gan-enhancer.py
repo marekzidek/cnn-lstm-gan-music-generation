@@ -76,8 +76,6 @@ def generator_model():
     # multiply to be able to outvote residual 6* connection    
     add = keras.layers.core.Lambda(lambda x:(x*12))(add)
     
-    #lstm = TimeDistributed(Dense(156, kernel_initializer='zeros'))(lstm)
-    
     residual = keras.layers.merge([amplified, forget, add], mode='sum')
     residual = Activation('sigmoid')(residual)
 
@@ -373,7 +371,7 @@ def train(BATCH_SIZE, SONG_LENGTH, EPOCH):
 
             
             
-            for i in range(100):
+            for i in range(3):
 
                 what_to_train = [0.5 for j in range(BATCH_SIZE)]
                 g_loss = generator_with_discriminator.train_on_batch(
@@ -408,7 +406,7 @@ def train(BATCH_SIZE, SONG_LENGTH, EPOCH):
             except Exception as e:
                 print(e)
 
-        print "saving generated songS for discriminator"
+        print "saving generated songs for discriminator"
         # save memory for discriminator to not forget about this being FAKE
         for i in range(len(latent_batches)):
             generated_music = generator.predict_on_batch(latent_batches[i])
