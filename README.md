@@ -1,6 +1,6 @@
 # cnn-lstm-gan-music-generation
 
-EDIT: An outline for this GAN scheme is included in my [Bachelor thesis](thesis.pdf), which experiments with LSTM skip-connections for music generation, and features very robust survey evaluation.
+EDIT: An outline for this GAN scheme is included in my [Bachelor thesis](150999794678469.pdf), which experiments with LSTM skip-connections for music generation, and features very robust survey evaluation.
 
 This program is used to enhance the outputs of recurrent neural music generator, it could also be used to tune human composed music.
 
